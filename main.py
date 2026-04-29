@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import json
 import logging
@@ -5,11 +6,15 @@ import os
 import sys
 import time
 import uuid
+from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlparse
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 from checkpoint import Checkpoint
 from dedup import ADMIN_URL_ORDER, _get_admin_code, dedup_addresses
 from fhir_client import ChapiClient
+from status_store import StatusStore
 
 PAGE_SIZE = 1000
 CHECKPOINT_INTERVAL_S = 3300
@@ -55,6 +60,28 @@ def _require_env(name):
     return val
 
 
+MODE = _require_env("MODE")
+TENANT = _require_env("TENANT")
+SERVER_KIND = _require_env("SERVER_KIND")
+FHIR_URL = _require_env("FHIR_URL").rstrip("/")
+CHAPI_API_KEY = _require_env("CHAPI_API_KEY")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
+CHECKPOINT_BUCKET = os.environ.get("CHECKPOINT_BUCKET", "dedup-patient")
+LIMIT = int(os.environ["LIMIT"]) if os.environ.get("LIMIT") else None
+PATIENT_ID = os.environ.get("PATIENT_ID", "").strip() or None
+
+if MODE not in ("backfill", "incremental"):
+    print(
+        json.dumps({"severity": "CRITICAL", "message": f"Invalid MODE: {MODE!r}"}),
+        flush=True,
+    )
+    sys.exit(1)
+
+
+def _now_z():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _is_noop(addrs, result):
     if len(result["deduped"]) != len(addrs):
         return False
@@ -82,62 +109,105 @@ def _kept_address_summary(addr):
     }
 
 
-def _now_z():
-    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+_fhir_sem = asyncio.Semaphore(20)  # overridden in lifespan with FHIR_CONCURRENCY
 
 
-def run():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _fhir_sem
+    _fhir_sem = asyncio.Semaphore(int(os.environ.get("FHIR_CONCURRENCY", "20")))
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.post("/run", status_code=202)
+async def trigger_run(background_tasks: BackgroundTasks):
+    run_id = uuid.uuid4().hex
+    status_store = StatusStore(bucket=CHECKPOINT_BUCKET, server=SERVER_KIND, tenant=TENANT)
+    await status_store.write_running(
+        run_id=run_id,
+        tenant=TENANT,
+        server=SERVER_KIND,
+        mode=MODE,
+        dry_run=DRY_RUN,
+        started_at=_now_z(),
+    )
+    background_tasks.add_task(_run_background, run_id, status_store)
+    return {"run_id": run_id, "status_url": f"/status/{run_id}"}
+
+
+@app.get("/status/{run_id}")
+async def get_status(run_id: str):
+    status_store = StatusStore(bucket=CHECKPOINT_BUCKET, server=SERVER_KIND, tenant=TENANT)
+    record = await status_store.read(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return record
+
+
+async def _run_background(run_id: str, status_store: StatusStore) -> None:
+    try:
+        summary = await run(run_id)
+        await status_store.write_final(
+            run_id=run_id,
+            status="completed",
+            finished_at=_now_z(),
+            summary=summary,
+            error=None,
+        )
+    except Exception as exc:
+        log = logging.getLogger(__name__)
+        log.error({"event": "background_task_error", "run_id": run_id, "error": repr(exc)})
+        await status_store.write_final(
+            run_id=run_id,
+            status="failed",
+            finished_at=_now_z(),
+            summary=None,
+            error=repr(exc)[:2048],
+        )
+
+
+async def run(run_id: str) -> dict:
     log = _setup_logging()
 
-    mode = _require_env("MODE")
-    dry_run = os.environ.get("DRY_RUN", "true").lower() != "false"
-    tenant = _require_env("TENANT")
-    server_kind = _require_env("SERVER_KIND")
-    fhir_url = _require_env("FHIR_URL").rstrip("/")
-    api_key = _require_env("CHAPI_API_KEY")
-    bucket = os.environ.get("CHECKPOINT_BUCKET", "dedup-patient")
-    limit = int(os.environ["LIMIT"]) if os.environ.get("LIMIT") else None
-    patient_id_env = os.environ.get("PATIENT_ID", "").strip() or None
-
-    if mode not in ("backfill", "incremental"):
-        print(
-            json.dumps({"severity": "CRITICAL", "message": f"Invalid MODE: {mode!r}"}),
-            flush=True,
-        )
-        sys.exit(1)
-
-    run_id = uuid.uuid4().hex
     start_mono = time.monotonic()
     start_ts = _now_z()
 
-    client = ChapiClient(base_url=fhir_url, api_key=api_key, timeout=HTTP_TIMEOUT_S)
-    cp = Checkpoint(bucket=bucket, server=server_kind, tenant=tenant)
+    cp = Checkpoint(bucket=CHECKPOINT_BUCKET, server=SERVER_KIND, tenant=TENANT)
+    status_store = StatusStore(bucket=CHECKPOINT_BUCKET, server=SERVER_KIND, tenant=TENANT)
 
     today = datetime.date.today().strftime("%Y-%m-%d")
-    if mode == "backfill":
-        initial_url = f"{fhir_url}/Patient?_count={PAGE_SIZE}"
+    if MODE == "backfill":
+        initial_url = f"{FHIR_URL}/Patient?_count={PAGE_SIZE}"
     else:
-        initial_url = f"{fhir_url}/Patient?_count={PAGE_SIZE}&_lastUpdated=ge{today}"
+        initial_url = f"{FHIR_URL}/Patient?_count={PAGE_SIZE}&_lastUpdated=ge{today}"
 
     checkpoint_written = False
     checkpoint_completed = False
 
-    if mode == "backfill" and not patient_id_env:
-        state = cp.read()
+    if MODE == "backfill" and not PATIENT_ID:
+        state = await cp.read()
         if state and state.get("next_page_token"):
             token = state["next_page_token"]
-            initial_url = f"{fhir_url}/Patient?_count={PAGE_SIZE}&_page_token={token}"
+            initial_url = f"{FHIR_URL}/Patient?_count={PAGE_SIZE}&_page_token={token}"
             log.info({"event": "checkpoint_resumed", "run_id": run_id, "next_page_token": token})
 
     log.info({
         "event": "run_start",
         "run_id": run_id,
-        "tenant": tenant,
-        "server": server_kind,
-        "mode": mode,
-        "dry_run": dry_run,
-        "limit": limit,
-        "patient_id": patient_id_env,
+        "tenant": TENANT,
+        "server": SERVER_KIND,
+        "mode": MODE,
+        "dry_run": DRY_RUN,
+        "limit": LIMIT,
+        "patient_id": PATIENT_ID,
         "ts": start_ts,
     })
 
@@ -148,14 +218,14 @@ def run():
     error_count = 0
     addresses_dropped_total = 0
 
-    def _emit_summary(chk_written, chk_completed):
-        log.info({
+    def _make_summary(chk_written, chk_completed):
+        return {
             "event": "run_summary",
             "run_id": run_id,
-            "tenant": tenant,
-            "server": server_kind,
-            "mode": mode,
-            "dry_run": dry_run,
+            "tenant": TENANT,
+            "server": SERVER_KIND,
+            "mode": MODE,
+            "dry_run": DRY_RUN,
             "duration_seconds": round(time.monotonic() - start_mono, 1),
             "patients_examined": examined,
             "patients_changed": changed,
@@ -165,9 +235,9 @@ def run():
             "addresses_dropped_total": addresses_dropped_total,
             "checkpoint_written": chk_written,
             "checkpoint_completed": chk_completed,
-        })
+        }
 
-    def _process_patient(patient):
+    async def _process_patient(patient):
         nonlocal examined, changed, skipped, error_count, addresses_dropped_total, conflict_412
 
         pid = ""
@@ -188,13 +258,13 @@ def run():
 
             kept_addr = result["deduped"][0]
 
-            if dry_run:
+            if DRY_RUN:
                 log.info({
                     "event": "patient_change",
                     "run_id": run_id,
-                    "tenant": tenant,
-                    "server": server_kind,
-                    "mode": mode,
+                    "tenant": TENANT,
+                    "server": SERVER_KIND,
+                    "mode": MODE,
                     "dry_run": True,
                     "patient_id": pid,
                     "count_before": len(addrs),
@@ -211,15 +281,16 @@ def run():
             else:
                 updated = dict(patient)
                 updated["address"] = result["deduped"]
-                new_vid, err = client.put_patient(pid, version_before, updated)
+                async with _fhir_sem:
+                    new_vid, err = await client.put_patient(pid, version_before, updated)
 
                 if err is None:
                     log.info({
                         "event": "patient_change",
                         "run_id": run_id,
-                        "tenant": tenant,
-                        "server": server_kind,
-                        "mode": mode,
+                        "tenant": TENANT,
+                        "server": SERVER_KIND,
+                        "mode": MODE,
                         "dry_run": False,
                         "patient_id": pid,
                         "count_before": len(addrs),
@@ -248,8 +319,8 @@ def run():
                     log.error({
                         "event": "patient_error",
                         "run_id": run_id,
-                        "tenant": tenant,
-                        "server": server_kind,
+                        "tenant": TENANT,
+                        "server": SERVER_KIND,
                         "patient_id": pid,
                         "error_type": error_type,
                         "status_code": status_code,
@@ -261,8 +332,8 @@ def run():
             log.error({
                 "event": "patient_error",
                 "run_id": run_id,
-                "tenant": tenant,
-                "server": server_kind,
+                "tenant": TENANT,
+                "server": SERVER_KIND,
                 "patient_id": pid,
                 "error_type": "exception",
                 "status_code": None,
@@ -271,81 +342,85 @@ def run():
         finally:
             examined += 1
 
-    if patient_id_env:
-        try:
-            resource, _ = client.get_patient(patient_id_env)
-        except Exception as e:
-            log.error({
-                "event": "patient_error",
-                "run_id": run_id,
-                "tenant": tenant,
-                "server": server_kind,
-                "patient_id": patient_id_env,
-                "error_type": "exception",
-                "status_code": None,
-                "fhir_outcome": repr(e)[:2048],
-            })
-            error_count += 1
-            examined += 1
-        else:
-            _process_patient(resource)
-        pagination_complete = True
-    else:
-        stop_flag = False
-        pagination_complete = False
+    pagination_complete = False
 
-        for bundle in client.iter_patient_bundles(initial_url):
-            has_next = False
-            next_token = None
-            for lnk in bundle.get("link", []):
-                if lnk.get("relation") == "next":
-                    has_next = True
-                    np = parse_qs(urlparse(lnk["url"]).query)
-                    next_token = np.get("_page_token", [None])[0]
-                    break
-
-            for entry in bundle.get("entry", []) or []:
-                patient = entry.get("resource")
-                if not patient or patient.get("resourceType") != "Patient":
-                    continue
-                _process_patient(patient)
-                if limit and examined >= limit:
-                    stop_flag = True
-                    break
-
-            if stop_flag:
-                break
-
-            # Checkpoint write at page boundary (backfill only, when time limit approaching)
-            if mode == "backfill" and next_token and (time.monotonic() - start_mono) > CHECKPOINT_INTERVAL_S:
-                state = {
+    async with ChapiClient(base_url=FHIR_URL, api_key=CHAPI_API_KEY, timeout=HTTP_TIMEOUT_S) as client:
+        if PATIENT_ID:
+            try:
+                resource, _ = await client.get_patient(PATIENT_ID)
+            except Exception as e:
+                log.error({
+                    "event": "patient_error",
                     "run_id": run_id,
-                    "next_page_token": next_token,
-                    "started_at": start_ts,
-                    "last_progress_at": _now_z(),
-                }
-                try:
-                    cp.write(state)
-                    checkpoint_written = True
-                    log.info({"event": "checkpoint_written", "run_id": run_id, "next_page_token": next_token})
-                except Exception as e:
-                    log.error({"event": "checkpoint_write_error", "run_id": run_id, "error": repr(e)})
-                _emit_summary(checkpoint_written, False)
-                return
+                    "tenant": TENANT,
+                    "server": SERVER_KIND,
+                    "patient_id": PATIENT_ID,
+                    "error_type": "exception",
+                    "status_code": None,
+                    "fhir_outcome": repr(e)[:2048],
+                })
+                error_count += 1
+                examined += 1
+            else:
+                await _process_patient(resource)
+            pagination_complete = True
+        else:
+            async for bundle in client.iter_patient_bundles(initial_url):
+                has_next = False
+                next_token = None
+                for lnk in bundle.get("link", []):
+                    if lnk.get("relation") == "next":
+                        has_next = True
+                        np = parse_qs(urlparse(lnk["url"]).query)
+                        next_token = np.get("_page_token", [None])[0]
+                        break
 
-            if not has_next:
-                pagination_complete = True
+                patients = [
+                    entry["resource"]
+                    for entry in bundle.get("entry", []) or []
+                    if entry.get("resource") and entry["resource"].get("resourceType") == "Patient"
+                ]
+                await asyncio.gather(*[_process_patient(p) for p in patients])
 
-    if mode == "backfill" and pagination_complete and not patient_id_env:
+                if LIMIT and examined >= LIMIT:
+                    break
+
+                if MODE == "backfill" and next_token and (time.monotonic() - start_mono) > CHECKPOINT_INTERVAL_S:
+                    state = {
+                        "run_id": run_id,
+                        "next_page_token": next_token,
+                        "started_at": start_ts,
+                        "last_progress_at": _now_z(),
+                    }
+                    try:
+                        await cp.write(state)
+                        checkpoint_written = True
+                        log.info({"event": "checkpoint_written", "run_id": run_id, "next_page_token": next_token})
+                    except Exception as e:
+                        log.error({"event": "checkpoint_write_error", "run_id": run_id, "error": repr(e)})
+
+                    summary = _make_summary(checkpoint_written, False)
+                    log.info(summary)
+                    await status_store.write_final(
+                        run_id=run_id,
+                        status="checkpointed",
+                        finished_at=_now_z(),
+                        summary=summary,
+                        error=None,
+                    )
+                    return summary
+
+                if not has_next:
+                    pagination_complete = True
+
+    if MODE == "backfill" and pagination_complete and not PATIENT_ID:
         try:
-            cp.delete()
+            await cp.delete()
             checkpoint_completed = True
             log.info({"event": "checkpoint_deleted", "run_id": run_id})
         except Exception as e:
             log.error({"event": "checkpoint_delete_error", "run_id": run_id, "error": repr(e)})
 
-    _emit_summary(checkpoint_written, checkpoint_completed)
-
-
-if __name__ == "__main__":
-    run()
+    summary = _make_summary(checkpoint_written, checkpoint_completed)
+    log.info(summary)
+    return summary

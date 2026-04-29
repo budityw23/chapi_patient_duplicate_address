@@ -1,0 +1,25 @@
+# Local secrets and environment files
+.env
+.env.*
+*.pem
+*-credential.json
+*-credentials.json
+
+# Python interpreter and virtual environments
+.python-version
+.venv/
+venv/
+env/
+
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Tooling and editor state
+.claude/
+.DS_Store
+.idea/
+.vscode/

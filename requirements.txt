@@ -1,2 +1,4 @@
-requests
+fastapi
+uvicorn[standard]
+httpx
 google-cloud-storage

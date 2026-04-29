@@ -1,91 +1,152 @@
 # CHAPI Implementation Status
 
-**Last updated:** 2026-04-28 (Phase 5)
-**Last updated by:** claude-sonnet-4-6
+**Last updated:** 2026-04-29 (Refactor Phase 5 — final validation complete, ready to deploy)
+**Last updated by:** agent
 
 The agent updates this file at the end of each phase. Use this file to
 remember where you stopped if the implementation spans multiple sessions.
 
 ---
 
-## Phase 1 — Address dedup function
+## Original Implementation — COMPLETE (do not re-implement)
 
-- [x] `requirements.txt` created with `requests` + `google-cloud-storage`
-- [x] `dedup.py` exports `dedup_addresses(addresses) -> dict`
-- [x] Module-level asserts cover all 5 required cases
-- [x] `python -c "import dedup"` runs cleanly (asserts pass at import)
+Phases 1–5 of the original synchronous CLI implementation are fully done and
+merged to `main`. The code is production-ready (deployed to Cloud Run Job).
+These notes are kept as context only.
 
-**Notes from agent:**
-Created `requirements.txt` and `dedup.py` with the full `dedup_addresses` pure function (greedy clique grouping, score-based winner selection, admin-code sub-extension sort). All five module-level asserts pass cleanly on import (`python3 -c "import dedup"` exits 0).
-
----
-
-## Phase 2 — FHIR client + GCS checkpoint
-
-- [x] `fhir_client.py`: `ChapiClient` with `iter_patient_bundles`, `get_patient`, `put_patient`
-- [x] `_page_token` rebuild preserves other query params (e.g. `_lastUpdated`)
-- [x] `checkpoint.py`: `Checkpoint` with `read` / `write` / `delete` (`delete` is idempotent)
-- [x] Smoke verified: bundle fetch, single GET, GCS round trip on `_smoke` key
-- [x] Smoke script removed (no scratch files left behind)
-
-**Notes from agent:**
-Created `fhir_client.py` (ChapiClient: iter_patient_bundles rebuilds next URL by extracting `_page_token` from the healthcare.googleapis.com link and reattaching it to the original proxy URL preserving all other params; get_patient and put_patient with If-Match) and `checkpoint.py` (Checkpoint: GCS read/write/delete with NotFound → None). Smoke verified against real CHAPI Purbalingga and dedup-patient bucket: bundle fetch returned 10 entries, single-patient GET returned non-empty versionId, GCS write/read/delete round trip succeeded. Note: local runs must use GOOGLE_APPLICATION_CREDENTIALS pointing to budi-triwibowo-editor-credential.json (the session default points to a lombok-barat SA without bucket access).
+- [x] Phase 1 — `dedup.py` pure function, 5 self-tests pass
+- [x] Phase 2 — `fhir_client.py` (ChapiClient, sync requests), `checkpoint.py` (GCS)
+- [x] Phase 3 — `main.py` dry-run loop, checkpoint resume, JSON logging
+- [x] Phase 4 — live PUT, 412/4xx/5xx handling, backfill checkpoint write
+- [x] Phase 5 — pre-deploy validation, regression dry-run clean, handed off to human
 
 ---
 
-## Phase 3 — Main loop, dry-run smoke
+## Refactor — FastAPI + asyncio (Cloud Run Service)
 
-- [x] `main.py` reads env, validates required vars, fails fast on missing
-- [x] JSON-formatted stdout logging (stdlib `logging`, no `google-cloud-logging` lib)
-- [x] Search URL correct for `MODE=backfill` and `MODE=incremental`
-- [x] Backfill checkpoint resume reads from GCS at startup
-- [x] Per-patient flow: skip ≤1, skip no-change, emit `patient_change` event
-- [x] Counters wired (examined, changed, skipped, 412, error, addresses_dropped)
-- [x] `LIMIT` honored
-- [x] `run_summary` event emitted at exit
-- [x] Local dry-run with `LIMIT=200` produces ≥1 valid `patient_change` event
-- [x] Eyeballed ~10 events: kept_address.admin_code depth ≥ each dropped entry's
+Goal: switch from a sync CLI batch job (Cloud Run Job) to an async FastAPI
+service (Cloud Run Service) that supports concurrency > 1. Background task
+model for `/run`; GCS-backed run status.
 
-**Notes from agent:**
-Created `main.py` with JSON-line stdout logging, env-var validation with fast-fail, backfill/incremental URL logic, GCS checkpoint resume, and per-patient dedup flow with `_is_noop` check (covers both count reduction and sub-extension sort normalization). Incremental dry-run with `LIMIT=200` found 31 `patient_change` events (200 examined, 169 skipped, 0 errors); all kept addresses have admin_code depth ≥ dropped entries (these records have no admin codes, so the tiebreak is purely by highest array index, which is correct). Live-PUT path is a logged stub for Phase 4.
+Reference: `REFACTOR_PROMPT.md` (full spec for all 5 refactor phases).
 
 ---
 
-## Phase 4 — Live PUT smoke
+### Refactor Phase 1 — Dependencies & Setup
 
-- [x] Real PUT-If-Match wired into the per-patient flow
-- [x] 412 / 4xx / 5xx handling emits correct `error_type` and increments counter
-- [x] Exception handling: per-patient catch, emit `error_type: exception`, never abort
-- [x] Backfill checkpoint write at page boundary when elapsed > 3300s
-- [x] Local run with `MODE=backfill DRY_RUN=false LIMIT=50` applied real changes
-- [x] One changed patient verified via `curl` GET — `len(address) == count_after`
+- [x] `requirements.txt` updated: `fastapi`, `uvicorn[standard]`, `httpx`, `google-cloud-storage`; `requests` removed
+- [x] `.python-version` created with content `3.11`
+- [x] `requirements-dev.txt` created: `pytest`, `pytest-asyncio`, `respx`
+- [x] `pip install -r requirements.txt -r requirements-dev.txt` succeeds (no errors)
 
-**Notes from agent:**
-Replaced the Phase-3 stub with the real PUT path: `_process_patient` is now wrapped in try/except/finally (finally always increments `examined`; except logs `patient_error` with `error_type: exception`). 412 / 4xx / 5xx errors are handled explicitly with correct `error_type` and counter routing. Checkpoint write is wired at page boundary when elapsed > CHECKPOINT_INTERVAL_S (3300s) in backfill mode. Live smoke run (`MODE=backfill DRY_RUN=false LIMIT=50`): 5 `patient_change` events with `version_after != version_before`, 0 errors. Spot-checked patient `35f6e9a6`: server confirms `len(address)==1` with `versionId` matching the logged `version_after`. Dry-run regression also clean (50 examined, 7 changed, 0 errors).
+**Notes from agent:** Replaced `requirements.txt` (dropped `requests`, added `fastapi`, `uvicorn[standard]`, `httpx`), created `.python-version` (`3.11`) and `requirements-dev.txt`. Verified via a temporary venv — all packages resolved and installed cleanly with no conflicts.
 
 ---
 
-## Phase 5 — Pre-deploy validation
+### Refactor Phase 2 — Async FHIR Client
 
-- [x] All required files present; no `_smoke.py`, `__pycache__/`, or scratch
-- [x] `requirements.txt` lists both deps
-- [x] `main.py` has `if __name__ == "__main__":` entrypoint
-- [x] `deploy.sh` byte-identical to baseline
-- [x] Final regression dry-run (`LIMIT=50`) clean
-- [x] STOPPED before running `deploy.sh` — handed off to human
+- [x] `fhir_client.py` rewritten using `httpx.AsyncClient`
+- [x] `ChapiClient` is an async context manager (`__aenter__` / `__aexit__`)
+- [x] `iter_patient_bundles` is an async generator (`AsyncIterator[dict]`)
+- [x] `get_patient` and `put_patient` are `async def`
+- [x] `_rebuild_next_url` logic preserved exactly (preserves `_lastUpdated`, etc.)
+- [x] `put_patient` returns `(None, (status, body))` on non-2xx instead of raising
+- [x] `tests/test_fhir_client.py` written — all 8 required test cases present
+- [x] `pytest.ini` or `pyproject.toml` sets `asyncio_mode = "auto"`
+- [x] `pytest tests/test_fhir_client.py -v` — all 8 tests pass
 
-**Notes from agent:**
-All 9 required files present and no scratch files. `deploy.sh` diff against `git HEAD` is empty. Final dry-run regression (`MODE=incremental DRY_RUN=true LIMIT=50`): 50 examined, 1 changed (fewer than Phase 3's run because Phase 4 already fixed those patients — idempotency confirmed), 0 errors. Ready to deploy.
+**Notes from agent:** Rewrote `fhir_client.py` with `httpx.AsyncClient` as an async context manager; `_rebuild_next_url` preserved verbatim; `put_patient` returns `(None, (status, body))` on non-2xx without raising. Created `tests/test_fhir_client.py` (8 cases using `respx.MockRouter` + pytest-asyncio auto mode) and `pytest.ini`; all 8 tests pass.
+
+---
+
+### Refactor Phase 3 — Async Checkpoint + StatusStore
+
+- [x] `checkpoint.py` updated: `read`, `write`, `delete` are `async def` via `asyncio.to_thread()`
+- [x] `status_store.py` created: `StatusStore(bucket, server, tenant)`
+- [x] `StatusStore.write_running(run_id, tenant, server, mode, dry_run, started_at)` writes `status="running"` to GCS
+- [x] `StatusStore.write_final(run_id, status, finished_at, summary, error)` does read–merge–write
+- [x] `StatusStore.read(run_id)` returns `Optional[dict]`; `None` if not found
+- [x] GCS path for status: `status/{server}/{tenant}/{run_id}.json`
+- [x] `tests/test_checkpoint.py` written — all 4 required test cases present
+- [x] `tests/test_status_store.py` written — all 5 required test cases present
+- [x] `pytest tests/test_checkpoint.py tests/test_status_store.py -v` — all 9 tests pass
+
+**Notes from agent:** Updated `checkpoint.py`: each GCS call wrapped in an inner sync function passed to `asyncio.to_thread()`; logic unchanged. Created `status_store.py`: `write_final` does a read–merge–write inside a single `to_thread` call (NotFound starts from an empty dict); GCS path is `status/{server}/{tenant}/{run_id}.json`. All 9 tests pass using `unittest.mock.patch` on `storage.Client`.
+
+---
+
+### Refactor Phase 4 — FastAPI App + Async Main Logic
+
+- [x] `main.py` rewritten as FastAPI app
+- [x] `GET /health` returns `200 {"status": "ok"}`
+- [x] `POST /run` returns `202 {"run_id": "...", "status_url": "/status/<run_id>"}` immediately
+- [x] `GET /status/{run_id}` reads from GCS `StatusStore`; returns `404` if not found
+- [x] `lifespan` creates global `asyncio.Semaphore(FHIR_CONCURRENCY)` at startup
+- [x] `_run_background` writes `status="completed"` or `status="failed"` to GCS on finish
+- [x] `run()` is `async def`; uses `async with ChapiClient(...) as client:`
+- [x] Pagination loop: `async for bundle in client.iter_patient_bundles(...):`
+- [x] Patients within each bundle processed concurrently via `asyncio.gather()`
+- [x] Semaphore acquired only around `await client.put_patient()` (not the full coroutine)
+- [x] Checkpoint write and delete are `await`-ed
+- [x] All original log event field names preserved
+- [x] `run()` returns a summary dict (same fields as original `run_summary` log event)
+- [x] `deploy.sh` updated: `gcloud run jobs deploy` → `gcloud run services deploy`
+- [x] `deploy.sh` updated: `--task-timeout` → `--timeout`, `--max-retries 0` → `--min-instances 1`
+- [x] `deploy.sh` updated: `--port 8080`, `--concurrency 80`, `FHIR_CONCURRENCY=20` added
+- [x] `Procfile` created: `web: uvicorn main:app --host 0.0.0.0 --port $PORT`
+- [x] `tests/test_main.py` written — all 6 required test cases present
+- [x] `pytest tests/ -v` — all tests from all phases pass
+
+**Notes from agent:** Rewrote `main.py` as FastAPI app with lifespan semaphore, three endpoints, `_run_background` error handler, and async `run()`. `_process_patient` is a closure inside `run()` using `nonlocal` counters; semaphore wraps only the `put_patient` await. All 9 original log event types preserved. Updated `deploy.sh`: `JOB_NAME`→`SERVICE_NAME`, jobs→services, added `--port 8080 --concurrency 80 --min-instances 1 FHIR_CONCURRENCY=20`. Created `Procfile`. All 23 tests (Phases 1–4) pass.
+
+---
+
+### Refactor Phase 5 — Final Validation
+
+- [x] `pytest tests/ -v --tb=short` — full suite clean, zero failures
+- [x] `MODE=incremental TENANT=test SERVER_KIND=chapi FHIR_URL=http://x CHAPI_API_KEY=x python -c "from main import app; print('OK')"` prints `OK`
+- [x] `git diff dedup.py` — empty (dedup logic untouched)
+- [x] `git diff ../hapi_patient_duplicate_address/` — empty (HAPI untouched)
+- [x] Change summary printed by agent
+
+**Notes from agent:** All 23 tests pass; import check prints `OK`; `dedup.py` and `hapi_patient_duplicate_address/` diffs are empty.
+
+**Files changed/created in this refactor:**
+- `requirements.txt` — dropped `requests`, added `fastapi`, `uvicorn[standard]`, `httpx`
+- `.python-version` (new) — pins Python 3.11
+- `requirements-dev.txt` (new) — `pytest`, `pytest-asyncio`, `respx`
+- `fhir_client.py` — `requests.Session` → `httpx.AsyncClient`; async context manager; all methods `async def`; `_rebuild_next_url` verbatim
+- `checkpoint.py` — GCS calls wrapped in `asyncio.to_thread()`; all methods now `async def`; logic unchanged
+- `status_store.py` (new) — per-run GCS status at `status/{server}/{tenant}/{run_id}.json`; `write_running`, `write_final` (read–merge–write), `read`
+- `main.py` — sync CLI → FastAPI service; `/health`, `POST /run`, `GET /status/{run_id}`; lifespan semaphore; `_run_background`; async `run()` with `asyncio.gather()` per bundle; all helpers and log event field names preserved verbatim
+- `deploy.sh` — `gcloud run jobs` → `gcloud run services`; `JOB_NAME`→`SERVICE_NAME`; `--task-timeout`/`--max-retries 0` → `--timeout`/`--min-instances 1`; added `--port 8080`, `--concurrency 80`, `FHIR_CONCURRENCY=20`
+- `Procfile` (new) — `web: uvicorn main:app --host 0.0.0.0 --port $PORT`
+- `pytest.ini` (new) — `asyncio_mode = auto`, `pythonpath = .`
+- `tests/test_fhir_client.py` (new) — 8 tests for `ChapiClient`
+- `tests/test_checkpoint.py` (new) — 4 tests for async `Checkpoint`
+- `tests/test_status_store.py` (new) — 5 tests for `StatusStore`
+- `tests/test_main.py` (new) — 6 tests for endpoints and `_run_background`
+
+**Unchanged:** `dedup.py`, `hapi_patient_duplicate_address/`, `plan.md`
 
 ---
 
 ## Ready to deploy
 
-When Phase 5 is checked, the human runs:
+When Refactor Phase 5 is fully checked, the human runs:
 
 ```bash
 ./deploy.sh purbalingga
 ```
 
-(and optionally later `./deploy.sh lombok-barat` once URL/key for that
-tenant are known.)
+The service will be available at a Cloud Run URL. Trigger a run:
+
+```bash
+curl -X POST https://<service-url>/run
+# returns: {"run_id": "...", "status_url": "/status/<run_id>"}
+
+curl https://<service-url>/status/<run_id>
+# returns: run status from GCS
+```
+
+Set up Cloud Scheduler to POST to `/run` every hour.

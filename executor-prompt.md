@@ -1,128 +1,189 @@
-# CHAPI Executor Prompt
+# CHAPI Executor Prompt — FastAPI + asyncio Refactor
 
-This file tells **you (the human)** what to do when implementing the
-CHAPI dedup resolver via Claude Code (Sonnet 4.6). You can run this in
-parallel with the HAPI implementation — each lives in its own git
-worktree, so they won't step on each other.
+This file tells **you (the human)** how to drive the refactor using Claude Code
+(Sonnet 4.6). Each phase has a prompt you paste into Claude Code. Wait for the
+agent to finish and update `status.md` before moving to the next phase.
 
----
-
-## One-time setup (run once for the whole project)
-
-From the **main checkout**:
-
-```bash
-cd /home/budi/code/sphere_project/patient_duplicate_fields
-
-# init git if not already a repo
-if [ ! -d .git ]; then
-  git init -b main
-  git add -A
-  git commit -m "chore: initial scaffolding (exploration + deployment plans)"
-fi
-
-# create the chapi worktree on its own branch
-git worktree add ../patient_duplicate_fields-chapi -b chapi-impl
-```
-
-If you've already run setup for HAPI, the `git init` block is a no-op
-(idempotent guard).
+The full spec is in `REFACTOR_PROMPT.md`. The agent reads it directly — you do
+not need to paste its contents.
 
 ---
 
-## Open Claude Code in the worktree
+## Setup
+
+Open Claude Code inside `chapi_patient_duplicate_address/`:
 
 ```bash
-cd ../patient_duplicate_fields-chapi/chapi_patient_duplicate_address
-# launch Claude Code with Sonnet 4.6 (use whatever your launcher is)
+cd /home/budi/code/sphere_project/patient_duplicate_fields/chapi_patient_duplicate_address
 claude --model claude-sonnet-4-6
 ```
+
+No worktree is needed — work directly on `main`.
 
 ---
 
 ## Phase prompts
 
-Paste these one at a time. Wait for the agent to finish (it will update
-`status.md`) before sending the next.
+Paste one at a time. The agent reads `REFACTOR_PROMPT.md` for the full spec and
+`status.md` to know what is already done. Wait for `status.md` to be updated
+before sending the next prompt.
 
-### Phase 1 — start here
+---
+
+### Refactor Phase 1 — Dependencies & Setup
 
 ```text
-You are implementing the CHAPI patient-address dedup resolver. Read plan.md and status.md in this folder, and read ../.claude/deduplication_rule/dedup-patient-fields-prompt.md for the architectural spec.
+Read REFACTOR_PROMPT.md and status.md in this folder.
 
-Implement Phase 1 only. When done, update status.md to mark Phase 1 complete with a one-or-two-sentence note of what was built. Stop after Phase 1 — do not start Phase 2.
+The original implementation (CLI batch job) is complete. You are starting the
+FastAPI + asyncio refactor described in REFACTOR_PROMPT.md. Do not read or
+follow plan.md — it is the spec for the original implementation and its
+instructions conflict with the refactor (e.g. it says not to modify deploy.sh,
+keep requests, and use a __main__ entrypoint — all of which the refactor
+changes).
+
+Implement Refactor Phase 1 only:
+- Update requirements.txt (remove requests, add fastapi, uvicorn[standard], httpx, keep google-cloud-storage)
+- Create .python-version with content: 3.11
+- Create requirements-dev.txt with: pytest, pytest-asyncio, respx
+
+After creating the files, verify with:
+  pip install -r requirements.txt -r requirements-dev.txt
+
+Update status.md: mark all Refactor Phase 1 checkboxes as done, write a brief
+note under "Notes from agent". Stop — do not start Phase 2.
 ```
 
-### Phase 2
+---
+
+### Refactor Phase 2 — Async FHIR Client
 
 ```text
-Read status.md to confirm Phase 1 is complete. Implement Phase 2 only. Update status.md when done. Stop after Phase 2.
+Read status.md to confirm Refactor Phase 1 is complete. Read REFACTOR_PROMPT.md
+for the Phase 2 spec.
+
+Implement Refactor Phase 2 only:
+- Rewrite fhir_client.py using httpx.AsyncClient (exact signatures in REFACTOR_PROMPT.md)
+- Create tests/ directory and tests/test_fhir_client.py with all 8 required test cases
+- Add pytest.ini (or pyproject.toml) with asyncio_mode = "auto"
+
+Run tests before marking complete:
+  pytest tests/test_fhir_client.py -v
+
+All 8 tests must pass. Fix any failures before updating status.md.
+
+Update status.md: mark all Refactor Phase 2 checkboxes, write a note. Stop —
+do not start Phase 3.
 ```
 
-### Phase 3
+---
+
+### Refactor Phase 3 — Async Checkpoint + StatusStore
 
 ```text
-Read status.md to confirm Phases 1 and 2 are complete. Implement Phase 3 only. Update status.md when done. Stop after Phase 3.
+Read status.md to confirm Refactor Phases 1 and 2 are complete. Read
+REFACTOR_PROMPT.md for the Phase 3 spec.
+
+Implement Refactor Phase 3 only:
+- Update checkpoint.py: wrap read, write, delete in asyncio.to_thread()
+- Create status_store.py: StatusStore class with write_running, write_final, read
+- Create tests/test_checkpoint.py with all 4 required test cases
+- Create tests/test_status_store.py with all 5 required test cases
+
+Run tests before marking complete:
+  pytest tests/test_checkpoint.py tests/test_status_store.py -v
+
+All 9 tests must pass. Fix any failures before updating status.md.
+
+Update status.md: mark all Refactor Phase 3 checkboxes, write a note. Stop —
+do not start Phase 4.
 ```
 
-### Phase 4
+---
+
+### Refactor Phase 4 — FastAPI App + Async Main Logic
 
 ```text
-Read status.md to confirm Phases 1–3 are complete. Implement Phase 4 only.
+Read status.md to confirm Refactor Phases 1–3 are complete. Read
+REFACTOR_PROMPT.md for the Phase 4 spec.
 
-NOTE: Phase 4 performs ~5 real PUT writes against the production CHAPI Purbalingga server. The dedup rule is conservative (only drops, never invents data), so blast radius is bounded.
+Implement Refactor Phase 4 only:
+- Rewrite main.py as a FastAPI app (endpoints, lifespan, background task, async run loop)
+- Update deploy.sh: switch from Cloud Run Job to Cloud Run Service as specified
+- Create Procfile: web: uvicorn main:app --host 0.0.0.0 --port $PORT
+- Create tests/test_main.py with all 6 required test cases
 
-Update status.md when done. Stop after Phase 4.
+Key constraints from the spec (do not deviate):
+- POST /run returns 202 immediately; does NOT block until the run finishes
+- Semaphore acquired only around await client.put_patient(), not the full coroutine
+- All original log event field names must be preserved
+- deploy.sh switches gcloud run jobs deploy to gcloud run services deploy
+
+Run the full test suite before marking complete:
+  pytest tests/ -v
+
+All tests (from all phases) must pass. Fix any failures before updating status.md.
+
+Update status.md: mark all Refactor Phase 4 checkboxes, write a note. Stop —
+do not start Phase 5.
 ```
 
-### Phase 5
+---
+
+### Refactor Phase 5 — Final Validation
 
 ```text
-Read status.md to confirm Phases 1–4 are complete. Implement Phase 5 only — verification only. DO NOT run deploy.sh. The human will deploy after reviewing your work.
+Read status.md to confirm Refactor Phases 1–4 are complete. Read
+REFACTOR_PROMPT.md for the Phase 5 spec.
 
-Update status.md when done. Stop after Phase 5.
+Run the final validation checks in order:
+
+1. Full test suite:
+   pytest tests/ -v --tb=short
+   Must be zero failures.
+
+2. Import check with dummy env vars:
+   MODE=incremental TENANT=test SERVER_KIND=chapi FHIR_URL=http://x CHAPI_API_KEY=x \
+     python -c "from main import app; print('OK')"
+   Must print OK with no errors.
+
+3. Verify dedup.py is unchanged:
+   git diff dedup.py
+   Must be empty.
+
+4. Verify hapi_patient_duplicate_address/ is unchanged:
+   git diff ../hapi_patient_duplicate_address/
+   Must be empty.
+
+5. Print a summary of every file you changed or created and why.
+
+Do NOT run deploy.sh — the human will deploy after reviewing your work.
+
+Update status.md: mark all Refactor Phase 5 checkboxes, write a note including
+the change summary. Stop.
 ```
 
 ---
 
 ## After all phases complete
 
-Inside the worktree, commit everything:
+Review the change summary from Phase 5, then deploy:
 
 ```bash
-cd /home/budi/code/sphere_project/patient_duplicate_fields-chapi
-git add -A
-git commit -m "feat(chapi): implement patient address dedup resolver"
-```
-
-Merge back into `main` and clean up the worktree:
-
-```bash
-cd /home/budi/code/sphere_project/patient_duplicate_fields
-git merge chapi-impl --no-ff -m "merge: chapi resolver implementation"
-git worktree remove ../patient_duplicate_fields-chapi
-git branch -D chapi-impl
-```
-
-Now deploy when you're ready:
-
-```bash
-cd chapi_patient_duplicate_address
 ./deploy.sh purbalingga
-# (later, once Lombok Barat URL/key are known)
-# ./deploy.sh lombok-barat
 ```
+
+Set up Cloud Scheduler to `POST https://<service-url>/run` every hour.
 
 ---
 
-## If you need to resume mid-implementation
+## If you need to resume mid-refactor
 
-Just open Claude Code in the worktree again and paste the next phase
-prompt. The agent reads `status.md` to know where it left off; you don't
-need to re-paste earlier prompts.
+Open Claude Code in the folder again and paste the next unchecked phase prompt.
+The agent reads `status.md` to confirm prior phases are done.
 
-If you're not sure which phase is next, paste:
+If you are unsure which phase is next:
 
 ```text
-Read status.md and tell me the next unchecked phase. Do not implement anything yet.
+Read status.md and tell me the next incomplete refactor phase. Do not implement anything yet.
 ```

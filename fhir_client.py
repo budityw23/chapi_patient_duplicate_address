@@ -1,23 +1,31 @@
 import re
-from typing import Iterator, Optional
+from collections.abc import AsyncIterator
+from typing import Optional
 from urllib.parse import parse_qs, urlencode, urlparse
 
-import requests
+import httpx
 
 
 class ChapiClient:
-    def __init__(self, base_url: str, api_key: str, timeout: int = 60):
+    def __init__(self, base_url: str, api_key: str, timeout: int = 60) -> None:
         self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
         self.timeout = timeout
-        self._session = requests.Session()
-        self._session.headers.update(
-            {"X-API-Key": api_key, "Accept": "application/fhir+json"}
-        )
 
-    def iter_patient_bundles(self, initial_url: str) -> Iterator[dict]:
+    async def __aenter__(self) -> "ChapiClient":
+        self._client = httpx.AsyncClient(
+            headers={"X-API-Key": self.api_key, "Accept": "application/fhir+json"},
+            timeout=self.timeout,
+        )
+        return self
+
+    async def __aexit__(self, *args) -> None:
+        await self._client.aclose()
+
+    async def iter_patient_bundles(self, initial_url: str) -> AsyncIterator[dict]:
         url = initial_url
         while url:
-            resp = self._session.get(url, timeout=self.timeout)
+            resp = await self._client.get(url)
             resp.raise_for_status()
             bundle = resp.json()
             yield bundle
@@ -29,11 +37,9 @@ class ChapiClient:
             url = self._rebuild_next_url(initial_url, next_raw) if next_raw else None
 
     def _rebuild_next_url(self, initial_url: str, next_url: str) -> str:
-        # Extract _page_token from the CHAPI next link (healthcare.googleapis.com URL)
         next_params = parse_qs(urlparse(next_url).query, keep_blank_values=True)
         page_token = next_params.get("_page_token", [None])[0]
 
-        # Start from initial_url's params so we preserve _lastUpdated etc.
         initial_parsed = urlparse(initial_url)
         params = {k: v[0] for k, v in parse_qs(initial_parsed.query, keep_blank_values=True).items()}
         if page_token:
@@ -41,15 +47,15 @@ class ChapiClient:
 
         return f"{initial_parsed.scheme}://{initial_parsed.netloc}{initial_parsed.path}?{urlencode(params)}"
 
-    def get_patient(self, patient_id: str) -> tuple[dict, str]:
+    async def get_patient(self, patient_id: str) -> tuple[dict, str]:
         url = f"{self.base_url}/Patient/{patient_id}"
-        resp = self._session.get(url, timeout=self.timeout)
+        resp = await self._client.get(url)
         resp.raise_for_status()
         resource = resp.json()
         version_id = resource["meta"]["versionId"]
         return resource, version_id
 
-    def put_patient(
+    async def put_patient(
         self, patient_id: str, version_id: str, resource: dict
     ) -> tuple[Optional[str], Optional[tuple[int, dict]]]:
         url = f"{self.base_url}/Patient/{patient_id}"
@@ -57,7 +63,7 @@ class ChapiClient:
             "Content-Type": "application/fhir+json",
             "If-Match": f'W/"{version_id}"',
         }
-        resp = self._session.put(url, json=resource, headers=headers, timeout=self.timeout)
+        resp = await self._client.put(url, json=resource, headers=headers)
         if resp.status_code in (200, 201):
             try:
                 new_vid = resp.json()["meta"]["versionId"]
