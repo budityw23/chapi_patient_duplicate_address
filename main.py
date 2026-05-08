@@ -7,9 +7,10 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 
 from checkpoint import Checkpoint
 from dedup import ADMIN_URL_ORDER, _get_admin_code, dedup_addresses
@@ -69,6 +70,7 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
 CHECKPOINT_BUCKET = os.environ.get("CHECKPOINT_BUCKET", "dedup-patient")
 LIMIT = int(os.environ["LIMIT"]) if os.environ.get("LIMIT") else None
 PATIENT_ID = os.environ.get("PATIENT_ID", "").strip() or None
+FRESH = os.environ.get("FRESH", "false").lower() == "true"
 
 if MODE not in ("backfill", "incremental"):
     print(
@@ -88,10 +90,10 @@ def _is_noop(addrs, result):
     for orig_idx, deduped_addr in zip(result["kept_indices"], result["deduped"]):
         orig = addrs[orig_idx]
         for orig_ext in orig.get("extension", []):
-            if orig_ext.get("url") == "administrativeCode":
+            if orig_ext.get("url", "").endswith("administrativeCode"):
                 orig_order = [s["url"] for s in orig_ext.get("extension", [])]
                 for ded_ext in deduped_addr.get("extension", []):
-                    if ded_ext.get("url") == "administrativeCode":
+                    if ded_ext.get("url", "").endswith("administrativeCode"):
                         if orig_order != [s["url"] for s in ded_ext.get("extension", [])]:
                             return False
     return True
@@ -128,7 +130,11 @@ async def health():
 
 
 @app.post("/run", status_code=202)
-async def trigger_run(background_tasks: BackgroundTasks):
+async def trigger_run(
+    background_tasks: BackgroundTasks,
+    fresh: Optional[bool] = Query(None),
+):
+    use_fresh = fresh if fresh is not None else FRESH
     run_id = uuid.uuid4().hex
     status_store = StatusStore(bucket=CHECKPOINT_BUCKET, server=SERVER_KIND, tenant=TENANT)
     await status_store.write_running(
@@ -139,8 +145,8 @@ async def trigger_run(background_tasks: BackgroundTasks):
         dry_run=DRY_RUN,
         started_at=_now_z(),
     )
-    background_tasks.add_task(_run_background, run_id, status_store)
-    return {"run_id": run_id, "status_url": f"/status/{run_id}"}
+    background_tasks.add_task(_run_background, run_id, status_store, use_fresh)
+    return {"run_id": run_id, "fresh": use_fresh, "status_url": f"/status/{run_id}"}
 
 
 @app.get("/status/{run_id}")
@@ -152,9 +158,9 @@ async def get_status(run_id: str):
     return record
 
 
-async def _run_background(run_id: str, status_store: StatusStore) -> None:
+async def _run_background(run_id: str, status_store: StatusStore, use_fresh: bool) -> None:
     try:
-        summary = await run(run_id)
+        summary = await run(run_id, use_fresh)
         await status_store.write_final(
             run_id=run_id,
             status="completed",
@@ -174,30 +180,17 @@ async def _run_background(run_id: str, status_store: StatusStore) -> None:
         )
 
 
-async def run(run_id: str) -> dict:
+async def run(run_id: str, use_fresh: bool = False) -> dict:
     log = _setup_logging()
 
     start_mono = time.monotonic()
     start_ts = _now_z()
+    deadline_mono = start_mono + CHECKPOINT_INTERVAL_S
 
-    cp = Checkpoint(bucket=CHECKPOINT_BUCKET, server=SERVER_KIND, tenant=TENANT)
     status_store = StatusStore(bucket=CHECKPOINT_BUCKET, server=SERVER_KIND, tenant=TENANT)
-
-    today = datetime.date.today().strftime("%Y-%m-%d")
-    if MODE == "backfill":
-        initial_url = f"{FHIR_URL}/Patient?_count={PAGE_SIZE}"
-    else:
-        initial_url = f"{FHIR_URL}/Patient?_count={PAGE_SIZE}&_lastUpdated=ge{today}"
 
     checkpoint_written = False
     checkpoint_completed = False
-
-    if MODE == "backfill" and not PATIENT_ID:
-        state = await cp.read()
-        if state and state.get("next_page_token"):
-            token = state["next_page_token"]
-            initial_url = f"{FHIR_URL}/Patient?_count={PAGE_SIZE}&_page_token={token}"
-            log.info({"event": "checkpoint_resumed", "run_id": run_id, "next_page_token": token})
 
     log.info({
         "event": "run_start",
@@ -205,6 +198,7 @@ async def run(run_id: str) -> dict:
         "tenant": TENANT,
         "server": SERVER_KIND,
         "mode": MODE,
+        "fresh": use_fresh,
         "dry_run": DRY_RUN,
         "limit": LIMIT,
         "patient_id": PATIENT_ID,
@@ -225,6 +219,7 @@ async def run(run_id: str) -> dict:
             "tenant": TENANT,
             "server": SERVER_KIND,
             "mode": MODE,
+            "fresh": use_fresh,
             "dry_run": DRY_RUN,
             "duration_seconds": round(time.monotonic() - start_mono, 1),
             "patients_examined": examined,
@@ -342,7 +337,94 @@ async def run(run_id: str) -> dict:
         finally:
             examined += 1
 
-    pagination_complete = False
+    async def _scan_patients(
+        initial_url: str,
+        cp: Optional[Checkpoint],
+        label: str,
+    ) -> tuple[bool, bool]:
+        """Page through patients, process each, checkpoint when time runs out.
+
+        Returns (checkpoint_written, pagination_complete).
+        """
+        nonlocal checkpoint_written
+
+        chk_written = False
+        pag_complete = False
+
+        async for bundle in client.iter_patient_bundles(initial_url):
+            has_next = False
+            next_token = None
+            for lnk in bundle.get("link", []):
+                if lnk.get("relation") == "next":
+                    has_next = True
+                    np = parse_qs(urlparse(lnk["url"]).query)
+                    next_token = np.get("_page_token", [None])[0]
+                    break
+
+            patients = [
+                entry["resource"]
+                for entry in bundle.get("entry", []) or []
+                if entry.get("resource") and entry["resource"].get("resourceType") == "Patient"
+            ]
+            await asyncio.gather(*[_process_patient(p) for p in patients])
+
+            if LIMIT and examined >= LIMIT:
+                if cp and next_token:
+                    state = {
+                        "run_id": run_id,
+                        "next_page_token": next_token,
+                        "started_at": start_ts,
+                        "last_progress_at": _now_z(),
+                    }
+                    try:
+                        await cp.write(state)
+                        chk_written = True
+                        checkpoint_written = True
+                        log.info({"event": "checkpoint_written", "run_id": run_id, "label": label, "next_page_token": next_token})
+                    except Exception as e:
+                        log.error({"event": "checkpoint_write_error", "run_id": run_id, "label": label, "error": repr(e)})
+                    summary = _make_summary(chk_written, False)
+                    log.info(summary)
+                    await status_store.write_final(
+                        run_id=run_id,
+                        status="checkpointed",
+                        finished_at=_now_z(),
+                        summary=summary,
+                        error=None,
+                    )
+                    return chk_written, False
+                break
+
+            if cp and next_token and time.monotonic() > deadline_mono:
+                state = {
+                    "run_id": run_id,
+                    "next_page_token": next_token,
+                    "started_at": start_ts,
+                    "last_progress_at": _now_z(),
+                }
+                try:
+                    await cp.write(state)
+                    chk_written = True
+                    checkpoint_written = True
+                    log.info({"event": "checkpoint_written", "run_id": run_id, "label": label, "next_page_token": next_token})
+                except Exception as e:
+                    log.error({"event": "checkpoint_write_error", "run_id": run_id, "label": label, "error": repr(e)})
+
+                summary = _make_summary(chk_written, False)
+                log.info(summary)
+                await status_store.write_final(
+                    run_id=run_id,
+                    status="checkpointed",
+                    finished_at=_now_z(),
+                    summary=summary,
+                    error=None,
+                )
+                return chk_written, False
+
+            if not has_next:
+                pag_complete = True
+
+        return chk_written, pag_complete
 
     async with ChapiClient(base_url=FHIR_URL, api_key=CHAPI_API_KEY, timeout=HTTP_TIMEOUT_S) as client:
         if PATIENT_ID:
@@ -363,63 +445,71 @@ async def run(run_id: str) -> dict:
                 examined += 1
             else:
                 await _process_patient(resource)
-            pagination_complete = True
-        else:
-            async for bundle in client.iter_patient_bundles(initial_url):
-                has_next = False
-                next_token = None
-                for lnk in bundle.get("link", []):
-                    if lnk.get("relation") == "next":
-                        has_next = True
-                        np = parse_qs(urlparse(lnk["url"]).query)
-                        next_token = np.get("_page_token", [None])[0]
-                        break
 
-                patients = [
-                    entry["resource"]
-                    for entry in bundle.get("entry", []) or []
-                    if entry.get("resource") and entry["resource"].get("resourceType") == "Patient"
-                ]
-                await asyncio.gather(*[_process_patient(p) for p in patients])
+        elif MODE == "backfill":
+            cp = Checkpoint(bucket=CHECKPOINT_BUCKET, server=SERVER_KIND, tenant=TENANT)
+            initial_url = f"{FHIR_URL}/Patient?_count={PAGE_SIZE}"
 
-                if LIMIT and examined >= LIMIT:
-                    break
+            state = await cp.read()
+            if state and state.get("next_page_token"):
+                token = state["next_page_token"]
+                initial_url = f"{FHIR_URL}/Patient?_count={PAGE_SIZE}&_page_token={token}"
+                log.info({"event": "checkpoint_resumed", "run_id": run_id, "next_page_token": token})
 
-                if MODE == "backfill" and next_token and (time.monotonic() - start_mono) > CHECKPOINT_INTERVAL_S:
-                    state = {
-                        "run_id": run_id,
-                        "next_page_token": next_token,
-                        "started_at": start_ts,
-                        "last_progress_at": _now_z(),
-                    }
-                    try:
-                        await cp.write(state)
-                        checkpoint_written = True
-                        log.info({"event": "checkpoint_written", "run_id": run_id, "next_page_token": next_token})
-                    except Exception as e:
-                        log.error({"event": "checkpoint_write_error", "run_id": run_id, "error": repr(e)})
+            chk_w, pag_complete = await _scan_patients(initial_url, cp, "backfill")
 
+            if pag_complete:
+                try:
+                    await cp.delete()
+                    checkpoint_completed = True
+                    log.info({"event": "checkpoint_deleted", "run_id": run_id})
+                except Exception as e:
+                    log.error({"event": "checkpoint_delete_error", "run_id": run_id, "error": repr(e)})
+
+            if chk_w:
+                return _make_summary(checkpoint_written, checkpoint_completed)
+
+        elif MODE == "incremental":
+            rolling_cp = Checkpoint(
+                bucket=CHECKPOINT_BUCKET, server=SERVER_KIND, tenant=TENANT, kind="rolling",
+            )
+
+            # Phase 1: scan today's patients (fresh runs only, no checkpoint)
+            if use_fresh:
+                today = datetime.date.today().strftime("%Y-%m-%d")
+                fresh_url = f"{FHIR_URL}/Patient?_count={PAGE_SIZE}&_lastUpdated=ge{today}"
+                log.info({"event": "fresh_scan_start", "run_id": run_id})
+
+                _, _ = await _scan_patients(fresh_url, None, "fresh")
+
+                if time.monotonic() > deadline_mono:
                     summary = _make_summary(checkpoint_written, False)
                     log.info(summary)
-                    await status_store.write_final(
-                        run_id=run_id,
-                        status="checkpointed",
-                        finished_at=_now_z(),
-                        summary=summary,
-                        error=None,
-                    )
                     return summary
 
-                if not has_next:
-                    pagination_complete = True
+                log.info({"event": "fresh_scan_done", "run_id": run_id})
 
-    if MODE == "backfill" and pagination_complete and not PATIENT_ID:
-        try:
-            await cp.delete()
-            checkpoint_completed = True
-            log.info({"event": "checkpoint_deleted", "run_id": run_id})
-        except Exception as e:
-            log.error({"event": "checkpoint_delete_error", "run_id": run_id, "error": repr(e)})
+            # Phase 2: rolling scan through all patients
+            rolling_url = f"{FHIR_URL}/Patient?_count={PAGE_SIZE}"
+            rolling_state = await rolling_cp.read()
+            if rolling_state and rolling_state.get("next_page_token"):
+                token = rolling_state["next_page_token"]
+                rolling_url = f"{FHIR_URL}/Patient?_count={PAGE_SIZE}&_page_token={token}"
+                log.info({"event": "rolling_resumed", "run_id": run_id, "next_page_token": token})
+
+            log.info({"event": "rolling_scan_start", "run_id": run_id})
+            chk_w, rolling_complete = await _scan_patients(rolling_url, rolling_cp, "rolling")
+
+            if rolling_complete:
+                try:
+                    await rolling_cp.delete()
+                    checkpoint_completed = True
+                    log.info({"event": "rolling_wrapped", "run_id": run_id})
+                except Exception as e:
+                    log.error({"event": "rolling_wrap_error", "run_id": run_id, "error": repr(e)})
+
+            if chk_w:
+                return _make_summary(checkpoint_written, checkpoint_completed)
 
     summary = _make_summary(checkpoint_written, checkpoint_completed)
     log.info(summary)

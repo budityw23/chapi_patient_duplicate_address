@@ -7,10 +7,11 @@ from google.cloud import storage
 
 
 class Checkpoint:
-    def __init__(self, bucket: str, server: str, tenant: str) -> None:
+    def __init__(self, bucket: str, server: str, tenant: str, kind: str = "backfill") -> None:
         self._client = storage.Client()
+        filename = "rolling_state.json" if kind == "rolling" else "state.json"
         self._blob = self._client.bucket(bucket).blob(
-            f"checkpoint/{server}/{tenant}/state.json"
+            f"checkpoint/{server}/{tenant}/{filename}"
         )
 
     async def read(self) -> Optional[dict]:

@@ -50,3 +50,19 @@ async def test_delete_suppresses_not_found(mock_gcs):
     mock_blob.delete.side_effect = NotFound("blob")
 
     await cp.delete()  # must not raise
+
+
+def test_default_kind_uses_state_json():
+    with patch("checkpoint.storage.Client") as MockClient:
+        mock_bucket = MagicMock()
+        MockClient.return_value.bucket.return_value = mock_bucket
+        Checkpoint("test-bucket", "chapi", "purbalingga")
+        mock_bucket.blob.assert_called_once_with("checkpoint/chapi/purbalingga/state.json")
+
+
+def test_rolling_kind_uses_rolling_state_json():
+    with patch("checkpoint.storage.Client") as MockClient:
+        mock_bucket = MagicMock()
+        MockClient.return_value.bucket.return_value = mock_bucket
+        Checkpoint("test-bucket", "chapi", "purbalingga", kind="rolling")
+        mock_bucket.blob.assert_called_once_with("checkpoint/chapi/purbalingga/rolling_state.json")

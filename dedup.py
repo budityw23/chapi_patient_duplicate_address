@@ -16,8 +16,8 @@ def _normalize_line(address):
 
 def _get_admin_code(address):
     for ext in address.get("extension", []):
-        if ext.get("url") == "administrativeCode":
-            sub = {s["url"]: s.get("valueString") for s in ext.get("extension", [])}
+        if ext.get("url", "").endswith("administrativeCode"):
+            sub = {s["url"]: (s.get("valueString") or s.get("valueCode")) for s in ext.get("extension", [])}
             return (
                 sub.get("province"),
                 sub.get("city"),
@@ -81,7 +81,7 @@ def _score(address):
 
 def _sort_admin_code_extensions(address):
     for ext in address.get("extension", []):
-        if ext.get("url") == "administrativeCode":
+        if ext.get("url", "").endswith("administrativeCode"):
             subs = ext.get("extension", [])
             subs.sort(
                 key=lambda s: (
@@ -120,8 +120,10 @@ def dedup_addresses(addresses):
         winner = max(group, key=lambda i: (_score(addresses[i]), i))
         kept_set.add(winner)
 
-    kept_indices = sorted(kept_set)
-    dropped_indices = [i for i in range(n) if i not in kept_set]
+    # Sort by score descending so the most complete address is first;
+    # break ties by original index ascending for stability.
+    kept_indices = sorted(kept_set, key=lambda i: (-_score(addresses[i]), i))
+    dropped_indices = sorted(i for i in range(n) if i not in kept_set)
 
     deduped = []
     for i in kept_indices:

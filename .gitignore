@@ -4,6 +4,7 @@
 *.pem
 *-credential.json
 *-credentials.json
+credentials_*.json
 
 # Python interpreter and virtual environments
 .python-version

@@ -39,6 +39,19 @@ def test_run_returns_202_with_run_id(client):
     data = response.json()
     assert data["run_id"]
     assert data["status_url"].startswith("/status/")
+    assert "fresh" in data
+
+
+def test_run_fresh_query_param(client):
+    mock_store = MagicMock()
+    mock_store.write_running = AsyncMock()
+
+    with patch("main.StatusStore", return_value=mock_store), \
+         patch("main._run_background", new_callable=AsyncMock):
+        response = client.post("/run?fresh=true")
+
+    assert response.status_code == 202
+    assert response.json()["fresh"] is True
 
 
 def test_status_found(client):
@@ -69,7 +82,7 @@ async def test_run_background_writes_completed_on_success():
     summary = {"event": "run_summary", "patients_examined": 10, "patients_changed": 2}
 
     with patch("main.run", new_callable=AsyncMock, return_value=summary):
-        await _run_background("run123", mock_store)
+        await _run_background("run123", mock_store, False)
 
     mock_store.write_final.assert_called_once()
     kwargs = mock_store.write_final.call_args.kwargs
@@ -83,7 +96,7 @@ async def test_run_background_writes_failed_on_exception():
     mock_store.write_final = AsyncMock()
 
     with patch("main.run", new_callable=AsyncMock, side_effect=RuntimeError("boom")):
-        await _run_background("run456", mock_store)
+        await _run_background("run456", mock_store, False)
 
     mock_store.write_final.assert_called_once()
     kwargs = mock_store.write_final.call_args.kwargs
